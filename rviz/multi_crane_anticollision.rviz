@@ -1,0 +1,175 @@
+Panels:
+  - Class: rviz/Displays
+    Help Height: 70
+    Name: Displays
+    Property Tree Widget:
+      Expanded:
+        - /Grid1
+      Splitter Ratio: 0.5
+    Tree Height: 216
+  - Class: rviz/Selection
+    Name: Selection
+  - Class: rviz/Tool Properties
+    Expanded: ~
+    Name: Tool Properties
+    Splitter Ratio: 0.5
+  - Class: rviz/Views
+    Expanded:
+      - /Current View1
+    Name: Views
+    Splitter Ratio: 0.5
+Preferences:
+  PromptSaveOnExit: true
+Toolbars:
+  toolButtonStyle: 2
+Visualization Manager:
+  Class: ""
+  Displays:
+    - Alpha: 0.5
+      Cell Size: 1
+      Class: rviz/Grid
+      Color: 160; 160; 160
+      Enabled: true
+      Line Style:
+        Line Width: 0.029999999329447746
+        Value: Lines
+      Name: Grid
+      Normal Cell Count: 0
+      Offset:
+        X: 0
+        Y: 0
+        Z: 0
+      Plane: XY
+      Plane Cell Count: 100
+      Reference Frame: <Fixed Frame>
+      Value: true
+    - Class: rviz/TF
+      Enabled: true
+      Filter (blacklist): ""
+      Filter (whitelist): ""
+      Frame Timeout: 15
+      Frames:
+        All Enabled: true
+        crane_a/base:
+          Value: true
+        crane_a/hook:
+          Value: true
+        crane_a/slew_center:
+          Value: true
+        crane_a/trolley:
+          Value: true
+        crane_b/base:
+          Value: true
+        crane_b/hook:
+          Value: true
+        crane_b/slew_center:
+          Value: true
+        crane_b/trolley:
+          Value: true
+        world:
+          Value: true
+      Marker Alpha: 1
+      Marker Scale: 1
+      Name: TF
+      Show Arrows: true
+      Show Axes: true
+      Show Names: true
+      Tree:
+        world:
+          crane_a/base:
+            {}
+          crane_a/hook:
+            {}
+          crane_a/slew_center:
+            {}
+          crane_a/trolley:
+            {}
+          crane_b/base:
+            {}
+          crane_b/hook:
+            {}
+          crane_b/slew_center:
+            {}
+          crane_b/trolley:
+            {}
+      Update Interval: 0
+      Value: true
+    - Class: rviz/MarkerArray
+      Enabled: true
+      Marker Topic: /crane_anticollision/markers
+      Name: AntiCollisionMarkers
+      Namespaces:
+        crane_a/arm: true
+        crane_a/hook: true
+        crane_a/mast: true
+        crane_a/rope: true
+        crane_a/trolley: true
+        crane_b/arm: true
+        crane_b/hook: true
+        crane_b/mast: true
+        crane_b/rope: true
+        crane_b/trolley: true
+        summary: true
+      Queue Size: 100
+      Value: true
+  Enabled: true
+  Global Options:
+    Background Color: 48; 48; 48
+    Default Light: true
+    Fixed Frame: world
+    Frame Rate: 30
+  Name: root
+  Tools:
+    - Class: rviz/Interact
+      Hide Inactive Objects: true
+    - Class: rviz/MoveCamera
+    - Class: rviz/Select
+    - Class: rviz/FocusCamera
+    - Class: rviz/Measure
+    - Class: rviz/SetInitialPose
+      Theta std deviation: 0.2617993950843811
+      Topic: initialpose
+      X std deviation: 0.5
+      Y std deviation: 0.5
+    - Class: rviz/SetGoal
+      Topic: goal
+  Value: true
+  Views:
+    Current:
+      Class: rviz/Orbit
+      Distance: 170.00064086914062
+      Enable Stereo Rendering:
+        Stereo Eye Separation: 0.05999999865889549
+        Stereo Focal Distance: 1
+        Swap Stereo Eyes: false
+        Value: false
+      Field of View: 0.7853981852531433
+      Focal Point:
+        X: 0
+        Y: 0
+        Z: 0
+      Focal Shape Fixed Size: true
+      Focal Shape Size: 0.05000000074505806
+      Invert Z Axis: false
+      Name: Current View
+      Near Clip Distance: 0.009999999776482582
+      Pitch: 0.7653982043266296
+      Target Frame: <Fixed Frame>
+      Yaw: 2.085397481918335
+    Saved: ~
+Window Geometry:
+  Displays:
+    collapsed: false
+  Height: 1043
+  Hide Left Dock: false
+  Hide Right Dock: false
+  QMainWindow State: 000000ff00000000fd000000010000000000000156000003bdfc0200000004fb000000100044006900730070006c006100790073010000003b00000159000000c700fffffffb0000001200530065006c0065006300740069006f006e010000019a0000009e0000005c00fffffffb0000001e0054006f006f006c002000500072006f0070006500720074006900650073010000023e0000009f0000005c00fffffffb0000000a0056006900650077007301000002e300000115000000a000ffffff000005dc000003bd00000004000000040000000800000008fc0000000100000002000000010000000a0054006f006f006c00730100000000ffffffff0000000000000000
+  Selection:
+    collapsed: false
+  Tool Properties:
+    collapsed: false
+  Views:
+    collapsed: false
+  Width: 1848
+  X: 72
+  Y: 0

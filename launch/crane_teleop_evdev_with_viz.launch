@@ -1,0 +1,26 @@
+<?xml version="1.0"?>
+<launch>
+  <!-- evdev 键盘控制：支持多键同时按下 + 松开立停 -->
+
+  <!-- 默认使用 by-id 下的键盘设备（更稳定）；也可在 roslaunch 时用 device:=... 覆盖 -->
+  <arg name="device" default="/dev/input/by-id/usb-USB_Keyboard_USB_Keyboard_C108Light00A-event-kbd"/>
+
+  <!-- 统一配置：一次加载三个节点的参数（按节点名分 namespace） -->
+  <rosparam command="load" file="$(find crane_anticollision)/config/crane_anticollision_all.yaml"/>
+
+  <node name="crane_teleop_evdev" pkg="crane_anticollision" type="crane_teleop_evdev_node" output="screen">
+    <!-- device 是机器相关参数，建议用 arg 覆盖 -->
+    <param name="device" value="$(arg device)"/>
+  </node>
+
+  <!-- 防碰撞核心节点（策略3：智能协商避让） -->
+  <node name="multi_crane_anticollision" pkg="crane_anticollision" type="multi_crane_anticollision_node" output="screen">
+  </node>
+
+  <!-- 可视化节点（订阅 A/B 两个 topic + 限制信息） -->
+  <node name="multi_crane_viz" pkg="crane_anticollision" type="multi_crane_anticollision_viz_node" output="screen">
+  </node>
+
+  <node name="rviz" pkg="rviz" type="rviz" args="-d $(find crane_anticollision)/rviz/multi_crane_anticollision.rviz" />
+</launch>
+
