@@ -1,6 +1,7 @@
 #include <ros/ros.h>
 #include <crane_msg/JointPoseMsg.h>
 #include <crane_msg/LoadCollisionAvoidCtrlLimit.h>
+#include "crane_anticollision/CraneGearLimit.h"
 
 #include <linux/input.h>
 #include <fcntl.h>
@@ -10,8 +11,11 @@
 #include <cmath>
 #include <cstring>
 #include <string>
-#include <unordered_set>
 #include <mutex>
+#include <unordered_set>
+#include <vector>
+
+#include <XmlRpcValue.h>
 
 // Read /dev/input/event* to get real KEY_DOWN/KEY_UP, enabling multi-key combos + immediate stop on release.
 
@@ -38,6 +42,11 @@ struct CraneState {
   double vel_theta{0.0};  // 当前实际速度（度/秒）
   double vel_r{0.0};      // 当前实际速度（米/秒）
   double vel_z{0.0};      // 当前实际速度（米/秒）
+
+  // Gear index (1-based)
+  int gear_theta{1};
+  int gear_r{1};
+  int gear_z{1};
 };
 
 int main(int argc, char** argv) {
@@ -46,7 +55,8 @@ int main(int argc, char** argv) {
   ros::NodeHandle pnh("~");
 
   std::string device;
-  std::string output_topic_a, output_topic_b, output_topic_c;
+  std::string output_topic_a, output_topic_b;
+  std::string gear_limit_topic_a, gear_limit_topic_b;
   double hz = 50.0;
   double vel_theta_deg_per_sec = 5.0;  // 最大速度
   double vel_r_m_per_sec = 0.5;
@@ -66,7 +76,8 @@ int main(int argc, char** argv) {
   pnh.param<std::string>("device", device, "/dev/input/by-id/usb-keyboard-event-kbd");
   pnh.param<std::string>("output_topic_a", output_topic_a, "/crane_teleop/crane_a_states");
   pnh.param<std::string>("output_topic_b", output_topic_b, "/crane_teleop/crane_b_states");
-  pnh.param<std::string>("output_topic_c", output_topic_c, "/crane_teleop/crane_c_states");
+  pnh.param<std::string>("gear_limit_topic_a", gear_limit_topic_a, "/planner/gear_limit_a");
+  pnh.param<std::string>("gear_limit_topic_b", gear_limit_topic_b, "/planner/gear_limit_b");
   pnh.param("hz", hz, 50.0);
   pnh.param("vel_theta_deg_per_sec", vel_theta_deg_per_sec, 5.0);
   pnh.param("vel_r_m_per_sec", vel_r_m_per_sec, 0.5);
@@ -80,19 +91,37 @@ int main(int argc, char** argv) {
   pnh.param("decel_r_m_per_sec2", decel_r_m_per_sec2, 1.5);
   pnh.param("decel_z_m_per_sec2", decel_z_m_per_sec2, 0.9);
 
-  CraneState A, B, C;
+  std::vector<double> slew_gears_deg_per_sec_default{0.7, 1.77, 2.66, 3.5};
+  std::vector<double> trolley_gears_m_per_sec_default{0.263, 0.616, 1.036};
+  std::vector<double> hoist_gears_m_per_sec_default{0.0735, 0.182, 0.362, 0.460, 0.604};
+  std::vector<double> slew_gears_deg_per_sec;
+  std::vector<double> trolley_gears_m_per_sec;
+  std::vector<double> hoist_gears_m_per_sec;
+
+  auto loadGearList = [&](const std::string& name, std::vector<double>& out,
+                          const std::vector<double>& defaults) {
+    XmlRpc::XmlRpcValue value;
+    if (pnh.getParam(name, value) && value.getType() == XmlRpc::XmlRpcValue::TypeArray) {
+      out.clear();
+      for (int i = 0; i < value.size(); ++i) {
+        out.push_back(static_cast<double>(value[i]));
+      }
+    } else {
+      out = defaults;
+    }
+  };
+
+  loadGearList("slew_gears_deg_per_sec", slew_gears_deg_per_sec, slew_gears_deg_per_sec_default);
+  loadGearList("trolley_gears_m_per_sec", trolley_gears_m_per_sec, trolley_gears_m_per_sec_default);
+  loadGearList("hoist_gears_m_per_sec", hoist_gears_m_per_sec, hoist_gears_m_per_sec_default);
+
+  CraneState A, B;
   pnh.param("init_a_theta_deg", A.theta_deg, 45.0);
   pnh.param("init_a_r", A.r, 15.0);
   pnh.param("init_a_z", A.z, 25.0);
   pnh.param("init_b_theta_deg", B.theta_deg, 235.0);
   pnh.param("init_b_r", B.r, 22.0);
   pnh.param("init_b_z", B.z, 6.0);
-  pnh.param("init_c_theta_deg", C.theta_deg, 120.0);
-  pnh.param("init_c_r", C.r, 18.0);
-  pnh.param("init_c_z", C.z, 20.0);
-
-  bool enable_crane_c_control = false;
-  pnh.param("enable_crane_c_control", enable_crane_c_control, false);
 
   const int fd = open(device.c_str(), O_RDONLY);
   if (fd < 0) {
@@ -109,11 +138,12 @@ int main(int argc, char** argv) {
 
   ros::Publisher pub_a = nh.advertise<crane_msg::JointPoseMsg>(output_topic_a, 1);
   ros::Publisher pub_b = nh.advertise<crane_msg::JointPoseMsg>(output_topic_b, 1);
-  ros::Publisher pub_c = nh.advertise<crane_msg::JointPoseMsg>(output_topic_c, 1);
 
   // 订阅防碰撞限制消息
   std::mutex limit_mutex;
-  bool force_stop_a = false, force_stop_b = false, force_stop_c = false;
+  bool force_stop_a = false, force_stop_b = false;
+  int gear_limit_theta_a = 4, gear_limit_r_a = 3, gear_limit_z_a = 5;
+  int gear_limit_theta_b = 4, gear_limit_r_b = 3, gear_limit_z_b = 5;
   
   auto limit_cb_a = [&](const crane_msg::LoadCollisionAvoidCtrlLimit::ConstPtr& msg) {
     std::lock_guard<std::mutex> lock(limit_mutex);
@@ -123,17 +153,27 @@ int main(int argc, char** argv) {
     std::lock_guard<std::mutex> lock(limit_mutex);
     force_stop_b = msg->need_stop_now;  // 强制刹停标志
   };
-  auto limit_cb_c = [&](const crane_msg::LoadCollisionAvoidCtrlLimit::ConstPtr& msg) {
+
+  auto gear_limit_cb_a = [&](const crane_anticollision::CraneGearLimit::ConstPtr& msg) {
     std::lock_guard<std::mutex> lock(limit_mutex);
-    force_stop_c = msg->need_stop_now;  // 强制刹停标志
+    gear_limit_theta_a = msg->gear_theta_limit;
+    gear_limit_r_a = msg->gear_r_limit;
+    gear_limit_z_a = msg->gear_z_limit;
   };
-  
+  auto gear_limit_cb_b = [&](const crane_anticollision::CraneGearLimit::ConstPtr& msg) {
+    std::lock_guard<std::mutex> lock(limit_mutex);
+    gear_limit_theta_b = msg->gear_theta_limit;
+    gear_limit_r_b = msg->gear_r_limit;
+    gear_limit_z_b = msg->gear_z_limit;
+  };
   ros::Subscriber sub_limit_a = nh.subscribe<crane_msg::LoadCollisionAvoidCtrlLimit>(
       "/planner/collision_avoid_info_a", 1, limit_cb_a);
   ros::Subscriber sub_limit_b = nh.subscribe<crane_msg::LoadCollisionAvoidCtrlLimit>(
       "/planner/collision_avoid_info_b", 1, limit_cb_b);
-  ros::Subscriber sub_limit_c = nh.subscribe<crane_msg::LoadCollisionAvoidCtrlLimit>(
-      "/planner/collision_avoid_info_c", 1, limit_cb_c);
+  ros::Subscriber sub_gear_limit_a = nh.subscribe<crane_anticollision::CraneGearLimit>(
+      gear_limit_topic_a, 1, gear_limit_cb_a);
+  ros::Subscriber sub_gear_limit_b = nh.subscribe<crane_anticollision::CraneGearLimit>(
+      gear_limit_topic_b, 1, gear_limit_cb_b);
 
   std::unordered_set<int> pressed;  // key codes currently pressed
 
@@ -142,9 +182,9 @@ int main(int argc, char** argv) {
   ROS_INFO("device: %s", device.c_str());
   ROS_INFO("A keys: W/S (r+/r-)  A/D (theta-/theta+)  Q/E (z+/z-)");
   ROS_INFO("B keys: I/K (r+/r-)  J/L (theta-/theta+) U/O (z+/z-)");
-  ROS_INFO("C keys: KP7/KP9 (r+/r-)  KP4/KP6 (theta-/theta+) KP8/KP5 (z+/z-) (enable_crane_c_control:=true)");
   ROS_INFO("SPACE: stop all  X: exit");
-  ROS_INFO("Topics: A=%s , B=%s , C=%s", output_topic_a.c_str(), output_topic_b.c_str(), output_topic_c.c_str());
+  ROS_INFO("Gear: hold direction key + number key (1..5) to set gear for that axis");
+  ROS_INFO("Topics: A=%s , B=%s", output_topic_a.c_str(), output_topic_b.c_str());
   ROS_INFO("========================================");
 
   ros::Rate rate(hz > 0.0 ? hz : 50.0);
@@ -169,6 +209,24 @@ int main(int argc, char** argv) {
     }
 
     auto down = [&](int key_code) -> bool { return pressed.find(key_code) != pressed.end(); };
+
+    const int gear_keys[] = {KEY_1, KEY_2, KEY_3, KEY_4, KEY_5, KEY_6, KEY_7, KEY_8, KEY_9};
+    bool any_gear_pressed = false;
+    for (int key : gear_keys) {
+      if (down(key)) {
+        any_gear_pressed = true;
+        break;
+      }
+    }
+
+    auto getPressedGear = [&](int max_gear) -> int {
+      if (max_gear <= 0) return 0;
+      const int max_check = std::min(max_gear, static_cast<int>(sizeof(gear_keys) / sizeof(gear_keys[0])));
+      for (int i = max_check; i >= 1; --i) {
+        if (down(gear_keys[i - 1])) return i;
+      }
+      return 0;
+    };
 
     // Compute commands from current pressed set (this gives immediate stop on release)
     auto computeCmd = [&](CraneState& C, int which) {
@@ -198,25 +256,55 @@ int main(int argc, char** argv) {
         if (down(KEY_L)) C.cmd_theta += 1.0;
         if (down(KEY_U)) C.cmd_z += 1.0;
         if (down(KEY_O)) C.cmd_z -= 1.0;
-      } else if (which == 2 && enable_crane_c_control) {
-        // Numeric keypad: 7/9 for r+/r-, 4/6 for theta-/theta+, 8/5 for z+/z-
-        if (down(KEY_KP7)) C.cmd_r += 1.0;
-        if (down(KEY_KP9)) C.cmd_r -= 1.0;
-        if (down(KEY_KP4)) C.cmd_theta -= 1.0;
-        if (down(KEY_KP6)) C.cmd_theta += 1.0;
-        if (down(KEY_KP8)) C.cmd_z += 1.0;
-        if (down(KEY_KP5)) C.cmd_z -= 1.0;
       }
 
       // Normalize to [-1, 0, 1] even if both pressed
       C.cmd_theta = (C.cmd_theta > 0.0) ? 1.0 : (C.cmd_theta < 0.0 ? -1.0 : 0.0);
       C.cmd_r = (C.cmd_r > 0.0) ? 1.0 : (C.cmd_r < 0.0 ? -1.0 : 0.0);
       C.cmd_z = (C.cmd_z > 0.0) ? 1.0 : (C.cmd_z < 0.0 ? -1.0 : 0.0);
+
+      const bool theta_active = (C.cmd_theta != 0.0);
+      const bool r_active = (C.cmd_r != 0.0);
+      const bool z_active = (C.cmd_z != 0.0);
+
+      const int theta_gear = getPressedGear(static_cast<int>(slew_gears_deg_per_sec.size()));
+      const int r_gear = getPressedGear(static_cast<int>(trolley_gears_m_per_sec.size()));
+      const int z_gear = getPressedGear(static_cast<int>(hoist_gears_m_per_sec.size()));
+
+      if (!any_gear_pressed) {
+        if (theta_active) C.gear_theta = 1;
+        if (r_active) C.gear_r = 1;
+        if (z_active) C.gear_z = 1;
+      }
+
+      if (theta_active && theta_gear > 0) C.gear_theta = theta_gear;
+      if (r_active && r_gear > 0) C.gear_r = r_gear;
+      if (z_active && z_gear > 0) C.gear_z = z_gear;
+
+      C.gear_theta = std::max(1, std::min(C.gear_theta, std::max(1, static_cast<int>(slew_gears_deg_per_sec.size()))));
+      C.gear_r = std::max(1, std::min(C.gear_r, std::max(1, static_cast<int>(trolley_gears_m_per_sec.size()))));
+      C.gear_z = std::max(1, std::min(C.gear_z, std::max(1, static_cast<int>(hoist_gears_m_per_sec.size()))));
     };
 
     computeCmd(A, 0);
     computeCmd(B, 1);
-    computeCmd(C, 2);
+
+    {
+      std::lock_guard<std::mutex> lock(limit_mutex);
+      if (gear_limit_theta_a <= 0) { A.cmd_theta = 0.0; A.gear_theta = 0; }
+      else A.gear_theta = std::min(A.gear_theta, gear_limit_theta_a);
+      if (gear_limit_r_a <= 0) { A.cmd_r = 0.0; A.gear_r = 0; }
+      else A.gear_r = std::min(A.gear_r, gear_limit_r_a);
+      if (gear_limit_z_a <= 0) { A.cmd_z = 0.0; A.gear_z = 0; }
+      else A.gear_z = std::min(A.gear_z, gear_limit_z_a);
+
+      if (gear_limit_theta_b <= 0) { B.cmd_theta = 0.0; B.gear_theta = 0; }
+      else B.gear_theta = std::min(B.gear_theta, gear_limit_theta_b);
+      if (gear_limit_r_b <= 0) { B.cmd_r = 0.0; B.gear_r = 0; }
+      else B.gear_r = std::min(B.gear_r, gear_limit_r_b);
+      if (gear_limit_z_b <= 0) { B.cmd_z = 0.0; B.gear_z = 0; }
+      else B.gear_z = std::min(B.gear_z, gear_limit_z_b);
+    }
 
     // 强制刹停覆盖手动控制（优先级最高）
     {
@@ -226,9 +314,6 @@ int main(int argc, char** argv) {
       }
       if (force_stop_b) {
         B.cmd_theta = B.cmd_r = B.cmd_z = 0.0;  // 强制刹停，覆盖手动控制
-      }
-      if (force_stop_c) {
-        C.cmd_theta = C.cmd_r = C.cmd_z = 0.0;  // 强制刹停，覆盖手动控制
       }
     }
 
@@ -282,13 +367,23 @@ int main(int argc, char** argv) {
       smoothVelocity(C.vel_z, target_v_z, accel_z, decel_z);
     };
     
-    updateVelocities(A, vel_theta_deg_per_sec, vel_r_m_per_sec, vel_z_m_per_sec,
+    auto gearSpeed = [&](const std::vector<double>& gears, int gear_idx, double fallback) {
+      if (gears.empty()) return fallback;
+      const int idx = std::max(1, std::min(gear_idx, static_cast<int>(gears.size())));
+      return gears[idx - 1];
+    };
+
+    const double max_v_theta_a = gearSpeed(slew_gears_deg_per_sec, A.gear_theta, vel_theta_deg_per_sec);
+    const double max_v_r_a = gearSpeed(trolley_gears_m_per_sec, A.gear_r, vel_r_m_per_sec);
+    const double max_v_z_a = gearSpeed(hoist_gears_m_per_sec, A.gear_z, vel_z_m_per_sec);
+    const double max_v_theta_b = gearSpeed(slew_gears_deg_per_sec, B.gear_theta, vel_theta_deg_per_sec);
+    const double max_v_r_b = gearSpeed(trolley_gears_m_per_sec, B.gear_r, vel_r_m_per_sec);
+    const double max_v_z_b = gearSpeed(hoist_gears_m_per_sec, B.gear_z, vel_z_m_per_sec);
+
+    updateVelocities(A, max_v_theta_a, max_v_r_a, max_v_z_a,
                      accel_theta_deg_per_sec2, accel_r_m_per_sec2, accel_z_m_per_sec2,
                      decel_theta_deg_per_sec2, decel_r_m_per_sec2, decel_z_m_per_sec2);
-    updateVelocities(B, vel_theta_deg_per_sec, vel_r_m_per_sec, vel_z_m_per_sec,
-                     accel_theta_deg_per_sec2, accel_r_m_per_sec2, accel_z_m_per_sec2,
-                     decel_theta_deg_per_sec2, decel_r_m_per_sec2, decel_z_m_per_sec2);
-    updateVelocities(C, vel_theta_deg_per_sec, vel_r_m_per_sec, vel_z_m_per_sec,
+    updateVelocities(B, max_v_theta_b, max_v_r_b, max_v_z_b,
                      accel_theta_deg_per_sec2, accel_r_m_per_sec2, accel_z_m_per_sec2,
                      decel_theta_deg_per_sec2, decel_r_m_per_sec2, decel_z_m_per_sec2);
 
@@ -307,13 +402,6 @@ int main(int argc, char** argv) {
     B.r = std::max(0.0, B.r);
     B.z = std::max(0.0, B.z);
 
-    C.theta_deg += C.vel_theta * dt;
-    C.r += C.vel_r * dt;
-    C.z += C.vel_z * dt;
-    normalizeAngleDeg(C.theta_deg);
-    C.r = std::max(0.0, C.r);
-    C.z = std::max(0.0, C.z);
-
     const ros::Time stamp = ros::Time::now();
 
     crane_msg::JointPoseMsg msg_a;
@@ -326,7 +414,7 @@ int main(int argc, char** argv) {
     msg_a.PolarRadiusVel = A.vel_r;
     msg_a.PolarHeightVel = A.vel_z;
     msg_a.SensorMsgError = false;
-    msg_a.PLCMode = 0;
+    msg_a.PLCMode = A.gear_theta + (A.gear_r * 10) + (A.gear_z * 100);
 
     crane_msg::JointPoseMsg msg_b;
     msg_b.header.stamp = stamp;
@@ -338,21 +426,9 @@ int main(int argc, char** argv) {
     msg_b.PolarRadiusVel = B.vel_r;
     msg_b.PolarHeightVel = B.vel_z;
     msg_b.SensorMsgError = false;
-    msg_b.PLCMode = 0;
-
-    crane_msg::JointPoseMsg msg_c = msg_a;
-    msg_c.PolarAngle = C.theta_deg;
-    msg_c.PolarRadius = C.r;
-    msg_c.PolarHeight = C.z;
-    msg_c.PolarAngleVel = C.vel_theta;
-    msg_c.PolarRadiusVel = C.vel_r;
-    msg_c.PolarHeightVel = C.vel_z;
-    msg_c.SensorMsgError = false;
-    msg_c.PLCMode = 0;
-
+    msg_b.PLCMode = B.gear_theta + (B.gear_r * 10) + (B.gear_z * 100);
     pub_a.publish(msg_a);
     pub_b.publish(msg_b);
-    pub_c.publish(msg_c);
 
     ros::spinOnce();
     rate.sleep();

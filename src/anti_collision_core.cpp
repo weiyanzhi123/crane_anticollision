@@ -6,10 +6,30 @@
 namespace crane_anticollision {
 
 namespace {
-constexpr double kDeg2Rad = M_PI / 180.0;
-
 double clampDouble(double v, double lo, double hi) {
   return std::max(lo, std::min(hi, v));
+}
+
+enum class CollisionType {
+  kNone,
+  kArmArm,
+  kArmRope,
+  kArmHook
+};
+
+CollisionType selectCollisionType(const crane_anticollision::AntiCollisionCore::DistanceResult& d) {
+  double best = d.arm_arm;
+  CollisionType type = CollisionType::kArmArm;
+  if (d.arm_rope < best) {
+    best = d.arm_rope;
+    type = CollisionType::kArmRope;
+  }
+  if (d.arm_hook < best) {
+    best = d.arm_hook;
+    type = CollisionType::kArmHook;
+  }
+  if (!std::isfinite(best)) return CollisionType::kNone;
+  return type;
 }
 
 double segmentSegmentDistance(const Eigen::Vector3d& p1, const Eigen::Vector3d& q1,
@@ -70,9 +90,11 @@ double pointSegmentDistance(const Eigen::Vector3d& p, const Eigen::Vector3d& a, 
 }
 
 double unwrapAngle(double prev, double curr) {
+  const double kPi = M_PI;
+  const double kTwoPi = 2.0 * M_PI;
   double diff = curr - prev;
-  if (diff > 180.0) curr -= 360.0;
-  else if (diff < -180.0) curr += 360.0;
+  if (diff > kPi) curr -= kTwoPi;
+  else if (diff < -kPi) curr += kTwoPi;
   return curr;
 }
 
@@ -134,18 +156,18 @@ void AntiCollisionCore::updateState(CraneState& state, const Observation& obs, c
   state.has_last_update = true;
   state.last_update_sec = now;
 
-  double theta_raw = obs.theta_deg + params.theta_offset_deg;
+  double theta_raw = obs.theta_rad + params.theta_offset_rad;
   if (state.valid && dt > 0.0 && dt < 1.0) {
-    theta_raw = unwrapAngle(state.theta_deg, theta_raw);
+    theta_raw = unwrapAngle(state.theta_rad, theta_raw);
   }
 
-  state.theta_deg = theta_raw;
+  state.theta_rad = theta_raw;
   state.r = obs.r;
   state.z = obs.z;
   state.valid = true;
 
   if (dt > 0.0 && dt < 1.0) {
-    state.theta_history.push_back(state.theta_deg);
+    state.theta_history.push_back(state.theta_rad);
     state.r_history.push_back(state.r);
     state.z_history.push_back(state.z);
 
@@ -154,10 +176,10 @@ void AntiCollisionCore::updateState(CraneState& state, const Observation& obs, c
     while (state.z_history.size() > cfg_.velocity_window_size) state.z_history.pop_front();
 
     if (state.theta_history.size() >= 2) {
-      state.theta_dot_deg_per_sec = estimateVelocity(state.theta_history, dt);
-      state.theta_dot_deg_per_sec = clampDouble(state.theta_dot_deg_per_sec,
-                                                -cfg_.max_theta_dot_deg_per_sec,
-                                                cfg_.max_theta_dot_deg_per_sec);
+      state.theta_dot_rad_per_sec = estimateVelocity(state.theta_history, dt);
+      state.theta_dot_rad_per_sec = clampDouble(state.theta_dot_rad_per_sec,
+                                                -cfg_.max_theta_dot_rad_per_sec,
+                                                cfg_.max_theta_dot_rad_per_sec);
     }
     if (state.r_history.size() >= 2) {
       state.r_dot_m_per_sec = estimateVelocity(state.r_history, dt);
@@ -170,6 +192,44 @@ void AntiCollisionCore::updateState(CraneState& state, const Observation& obs, c
       state.z_dot_m_per_sec = clampDouble(state.z_dot_m_per_sec,
                                           -cfg_.max_z_dot_m_per_sec,
                                           cfg_.max_z_dot_m_per_sec);
+    }
+
+    if (state.has_last_velocity) {
+      state.theta_ddot_rad_per_sec2 = (state.theta_dot_rad_per_sec - state.last_theta_dot_rad_per_sec) / dt;
+      state.r_ddot_m_per_sec2 = (state.r_dot_m_per_sec - state.last_r_dot_m_per_sec) / dt;
+      state.z_ddot_m_per_sec2 = (state.z_dot_m_per_sec - state.last_z_dot_m_per_sec) / dt;
+    } else {
+      state.theta_ddot_rad_per_sec2 = 0.0;
+      state.r_ddot_m_per_sec2 = 0.0;
+      state.z_ddot_m_per_sec2 = 0.0;
+      state.has_last_velocity = true;
+    }
+
+    state.last_theta_dot_rad_per_sec = state.theta_dot_rad_per_sec;
+    state.last_r_dot_m_per_sec = state.r_dot_m_per_sec;
+    state.last_z_dot_m_per_sec = state.z_dot_m_per_sec;
+
+    if (cfg_.command_fusion_enabled) {
+      const double lead = cfg_.command_fusion_lead_time;
+      const double alpha = clampDouble(cfg_.command_fusion_alpha, 0.0, 1.0);
+
+      const double theta_cmd = state.theta_dot_rad_per_sec + state.theta_ddot_rad_per_sec2 * lead;
+      const double r_cmd = state.r_dot_m_per_sec + state.r_ddot_m_per_sec2 * lead;
+      const double z_cmd = state.z_dot_m_per_sec + state.z_ddot_m_per_sec2 * lead;
+
+      state.theta_dot_pred_rad_per_sec = clampDouble(
+          (1.0 - alpha) * state.theta_dot_rad_per_sec + alpha * theta_cmd,
+          -cfg_.max_theta_dot_rad_per_sec, cfg_.max_theta_dot_rad_per_sec);
+      state.r_dot_pred_m_per_sec = clampDouble(
+          (1.0 - alpha) * state.r_dot_m_per_sec + alpha * r_cmd,
+          -cfg_.max_r_dot_m_per_sec, cfg_.max_r_dot_m_per_sec);
+      state.z_dot_pred_m_per_sec = clampDouble(
+          (1.0 - alpha) * state.z_dot_m_per_sec + alpha * z_cmd,
+          -cfg_.max_z_dot_m_per_sec, cfg_.max_z_dot_m_per_sec);
+    } else {
+      state.theta_dot_pred_rad_per_sec = state.theta_dot_rad_per_sec;
+      state.r_dot_pred_m_per_sec = state.r_dot_m_per_sec;
+      state.z_dot_pred_m_per_sec = state.z_dot_m_per_sec;
     }
   }
 }
@@ -194,37 +254,71 @@ AntiCollisionCore::Result AntiCollisionCore::step(double /*now_sec*/) {
     return out;
   }
 
-  // 精确计算当前距离
-  const double d_min = computeMinDistance();
+  // 精确计算当前距离 + 类型（可选前推补偿）
+  const double t_comp = cfg_.latency_compensation_enabled ? std::max(0.0, cfg_.latency_compensation_time) : 0.0;
+  const DistanceResult d_current = computeMinDistanceDetailsAtTimeWithDecel(t_comp, 0.0, 0.0, 0.0);
+  const double d_min = d_current.min;
+  CollisionType decision_type = selectCollisionType(d_current);
 
   // 短时预测（考虑减速过程）
   double d_min_pred = d_min;
-  double ttc = std::numeric_limits<double>::infinity();
+  double ttc = (d_min < cfg_.D_stop) ? 0.0 : std::numeric_limits<double>::infinity();
 
-  // 与原实现保持一致：theta 的减速度会乘 kDeg2Rad
-  const double decel_theta = cfg_.prediction_decel_theta_deg_per_sec2 * kDeg2Rad;
+  const double decel_theta = cfg_.prediction_decel_theta_rad_per_sec2;
   const double decel_r = cfg_.prediction_decel_r_m_per_sec2;
   const double decel_z = cfg_.prediction_decel_z_m_per_sec2;
 
-  for (double t = 0.0; t <= cfg_.prediction_time; t += cfg_.prediction_step) {
-    const double d_t = computeMinDistanceAtTimeWithDecel(t, decel_theta, decel_r, decel_z);
-    if (d_t < d_min_pred) d_min_pred = d_t;
-    if (d_t < cfg_.D_stop && std::isinf(ttc)) {
+  for (double t = cfg_.prediction_step; t <= cfg_.prediction_time; t += cfg_.prediction_step) {
+    const DistanceResult d_t = computeMinDistanceDetailsAtTimeWithDecel(t, decel_theta, decel_r, decel_z);
+    if (d_t.min < d_min_pred) {
+      d_min_pred = d_t.min;
+      decision_type = selectCollisionType(d_t);
+    }
+    if (d_t.min < cfg_.D_stop && std::isinf(ttc)) {
       ttc = t;
     }
   }
 
-  const double d_decision = std::min(d_min, d_min_pred);
+  double d_decision = std::min(d_min, d_min_pred);
+
+  if (cfg_.braking_distance_guard_enabled) {
+    auto stoppingDistance = [](double v, double decel) -> double {
+      if (decel <= 1e-9) return 0.0;
+      return (v * v) / (2.0 * decel);
+    };
+    const double v_slew_a = std::abs(crane_a_state_.theta_dot_rad_per_sec) * cfg_.crane_a.arm_length;
+    const double v_trolley_a = std::abs(crane_a_state_.r_dot_m_per_sec);
+    const double v_hoist_a = std::abs(crane_a_state_.z_dot_m_per_sec);
+    const double v_slew_b = std::abs(crane_b_state_.theta_dot_rad_per_sec) * cfg_.crane_b.arm_length;
+    const double v_trolley_b = std::abs(crane_b_state_.r_dot_m_per_sec);
+    const double v_hoist_b = std::abs(crane_b_state_.z_dot_m_per_sec);
+
+    const double d_stop_a = stoppingDistance(v_slew_a, cfg_.prediction_decel_theta_rad_per_sec2 * cfg_.crane_a.arm_length) +
+                            stoppingDistance(v_trolley_a, cfg_.prediction_decel_r_m_per_sec2) +
+                            stoppingDistance(v_hoist_a, cfg_.prediction_decel_z_m_per_sec2);
+    const double d_stop_b = stoppingDistance(v_slew_b, cfg_.prediction_decel_theta_rad_per_sec2 * cfg_.crane_b.arm_length) +
+                            stoppingDistance(v_trolley_b, cfg_.prediction_decel_r_m_per_sec2) +
+                            stoppingDistance(v_hoist_b, cfg_.prediction_decel_z_m_per_sec2);
+    const double d_stop_guard = std::max(d_stop_a, d_stop_b) + cfg_.braking_distance_margin;
+    d_decision = std::min(d_decision, d_min - d_stop_guard);
+  }
 
   // 检查是否有运动趋势（速度不为0）
+  const double v_slew_a = std::abs(crane_a_state_.theta_dot_rad_per_sec) * cfg_.crane_a.arm_length;
+  const double v_trolley_a = std::abs(crane_a_state_.r_dot_m_per_sec);
+  const double v_hoist_a = std::abs(crane_a_state_.z_dot_m_per_sec);
+  const double v_slew_b = std::abs(crane_b_state_.theta_dot_rad_per_sec) * cfg_.crane_b.arm_length;
+  const double v_trolley_b = std::abs(crane_b_state_.r_dot_m_per_sec);
+  const double v_hoist_b = std::abs(crane_b_state_.z_dot_m_per_sec);
+
   const double speed_a = std::sqrt(
-      std::pow(crane_a_state_.theta_dot_deg_per_sec, 2) +
-      std::pow(crane_a_state_.r_dot_m_per_sec, 2) +
-      std::pow(crane_a_state_.z_dot_m_per_sec, 2));
+      std::pow(cfg_.speed_weight_slew * v_slew_a, 2) +
+      std::pow(cfg_.speed_weight_trolley * v_trolley_a, 2) +
+      std::pow(cfg_.speed_weight_hoist * v_hoist_a, 2));
   const double speed_b = std::sqrt(
-      std::pow(crane_b_state_.theta_dot_deg_per_sec, 2) +
-      std::pow(crane_b_state_.r_dot_m_per_sec, 2) +
-      std::pow(crane_b_state_.z_dot_m_per_sec, 2));
+      std::pow(cfg_.speed_weight_slew * v_slew_b, 2) +
+      std::pow(cfg_.speed_weight_trolley * v_trolley_b, 2) +
+      std::pow(cfg_.speed_weight_hoist * v_hoist_b, 2));
   constexpr double kSpeedThreshold = 0.01;
   const bool is_moving_a = (speed_a > kSpeedThreshold);
   const bool is_moving_b = (speed_b > kSpeedThreshold);
@@ -234,11 +328,17 @@ AntiCollisionCore::Result AntiCollisionCore::step(double /*now_sec*/) {
   bool low_risk = false;
   bool high_risk = false;
 
+  const double low_risk_thresh =
+      (decision_type == CollisionType::kArmRope || decision_type == CollisionType::kArmHook)
+          ? cfg_.D_warn
+          : cfg_.D_low_risk;
+  const bool ttc_critical = (ttc <= cfg_.t_latency + cfg_.t_brake + cfg_.t_margin);
+
   if (is_moving) {
-    if (d_decision < cfg_.D_high_risk || (ttc <= cfg_.t_latency + cfg_.t_brake + cfg_.t_margin)) {
+    if (ttc_critical || (decision_type == CollisionType::kArmArm && d_decision < cfg_.D_high_risk)) {
       high_risk = true;
       having_risk = true;
-    } else if (d_decision < cfg_.D_low_risk) {
+    } else if (d_decision < low_risk_thresh) {
       low_risk = true;
       having_risk = true;
     } else if (d_decision < cfg_.D_safe) {
@@ -308,14 +408,14 @@ AntiCollisionCore::Result AntiCollisionCore::step(double /*now_sec*/) {
 
 double AntiCollisionCore::computeRiskContribution(const CraneState& state, const CraneParams& params, bool /*is_a*/) const {
   const double speed_magnitude = std::sqrt(
-      std::pow(state.theta_dot_deg_per_sec * params.arm_length * kDeg2Rad, 2) +
+      std::pow(state.theta_dot_rad_per_sec * params.arm_length, 2) +
       std::pow(state.r_dot_m_per_sec, 2) +
       std::pow(state.z_dot_m_per_sec, 2));
   return speed_magnitude;
 }
 
 bool AntiCollisionCore::isMovingTowardRisk(bool is_a) {
-  constexpr double eps = 1e-3;
+  constexpr double eps = 1e-4;
 
   const CraneState state_a_backup = crane_a_state_;
   const CraneState state_b_backup = crane_b_state_;
@@ -326,7 +426,7 @@ bool AntiCollisionCore::isMovingTowardRisk(bool is_a) {
   double d_dtheta_b = 0.0, d_dr_b = 0.0, d_dz_b = 0.0;
 
   {
-    crane_a_state_.theta_deg += eps;
+    crane_a_state_.theta_rad += eps;
     const double d_pert = computeMinDistance();
     d_dtheta_a = (d_pert - d_current) / eps;
     crane_a_state_ = state_a_backup;
@@ -345,7 +445,7 @@ bool AntiCollisionCore::isMovingTowardRisk(bool is_a) {
   }
 
   {
-    crane_b_state_.theta_deg += eps;
+    crane_b_state_.theta_rad += eps;
     const double d_pert = computeMinDistance();
     d_dtheta_b = (d_pert - d_current) / eps;
     crane_b_state_ = state_b_backup;
@@ -368,11 +468,11 @@ bool AntiCollisionCore::isMovingTowardRisk(bool is_a) {
 
   double d_dt = 0.0;
   if (is_a) {
-    d_dt = d_dtheta_a * (crane_a_state_.theta_dot_deg_per_sec * kDeg2Rad) +
+    d_dt = d_dtheta_a * (crane_a_state_.theta_dot_rad_per_sec) +
            d_dr_a * crane_a_state_.r_dot_m_per_sec +
            d_dz_a * crane_a_state_.z_dot_m_per_sec;
   } else {
-    d_dt = d_dtheta_b * (crane_b_state_.theta_dot_deg_per_sec * kDeg2Rad) +
+    d_dt = d_dtheta_b * (crane_b_state_.theta_dot_rad_per_sec) +
            d_dr_b * crane_b_state_.r_dot_m_per_sec +
            d_dz_b * crane_b_state_.z_dot_m_per_sec;
   }
@@ -388,6 +488,10 @@ double AntiCollisionCore::computeMinDistanceAtTime(double t) const {
 }
 
 double AntiCollisionCore::computeMinDistanceAtTimeWithDecel(double t, double decel_theta, double decel_r, double decel_z) const {
+  return computeMinDistanceDetailsAtTimeWithDecel(t, decel_theta, decel_r, decel_z).min;
+}
+
+AntiCollisionCore::DistanceResult AntiCollisionCore::computeMinDistanceDetailsAtTimeWithDecel(double t, double decel_theta, double decel_r, double decel_z) const {
   const CraneState a_pred = predictStateWithDecel(crane_a_state_, t, cfg_.crane_a, decel_theta, decel_r, decel_z);
   const CraneState b_pred = predictStateWithDecel(crane_b_state_, t, cfg_.crane_b, decel_theta, decel_r, decel_z);
 
@@ -396,8 +500,8 @@ double AntiCollisionCore::computeMinDistanceAtTimeWithDecel(double t, double dec
   const Eigen::Vector3d C_a = cfg_.crane_a.base_xyz + Eigen::Vector3d(0.0, 0.0, cfg_.crane_a.mast_height);
   const Eigen::Vector3d C_b = cfg_.crane_b.base_xyz + Eigen::Vector3d(0.0, 0.0, cfg_.crane_b.mast_height);
 
-  const double theta_a_rad = a_pred.theta_deg * kDeg2Rad;
-  const double theta_b_rad = b_pred.theta_deg * kDeg2Rad;
+  const double theta_a_rad = a_pred.theta_rad;
+  const double theta_b_rad = b_pred.theta_rad;
 
   const Eigen::Vector3d T_a = C_a + cfg_.crane_a.arm_length * Eigen::Vector3d(std::cos(theta_a_rad), std::sin(theta_a_rad), 0.0);
   const Eigen::Vector3d T_b = C_b + cfg_.crane_b.arm_length * Eigen::Vector3d(std::cos(theta_b_rad), std::sin(theta_b_rad), 0.0);
@@ -411,15 +515,18 @@ double AntiCollisionCore::computeMinDistanceAtTimeWithDecel(double t, double dec
   const double arm_height_a = C_a.z();
   const double arm_height_b = C_b.z();
 
-  double d_min = std::numeric_limits<double>::max();
+  DistanceResult out;
 
   if (std::abs(arm_height_a - arm_height_b) < 5.0) {
     const double d_arm_arm = segmentSegmentDistance(C_a, T_a, C_b, T_b) -
                              (cfg_.crane_a.arm_radius + cfg_.crane_b.arm_radius);
-    d_min = std::min(d_min, d_arm_arm);
+    out.arm_arm = std::min(out.arm_arm, d_arm_arm);
+    out.min = std::min(out.min, d_arm_arm);
   }
 
-  if (arm_height_a < arm_height_b) {
+  const double kHeightEps = 1e-6;
+
+  if (arm_height_a <= arm_height_b + kHeightEps) {
     const double arm_top_a = arm_height_a + cfg_.crane_a.arm_radius;
     const double rope_bottom_b = std::min(H_b.z(), P_b.z()) - cfg_.crane_b.rope_radius;
     const double hook_bottom_b = H_b.z() - cfg_.crane_b.hook_radius;
@@ -437,35 +544,33 @@ double AntiCollisionCore::computeMinDistanceAtTimeWithDecel(double t, double dec
           std::max(cfg_.crane_b.rope_radius, cfg_.crane_b.hook_radius);
 
       bool should_check = false;
-      if (is_prediction) {
-        const Eigen::Vector2d T_a_2d = T_a.head<2>();
-        const double dist_Ta_to_Pb = (T_a_2d - P_b_2d).norm();
-        const double dist_Ta_to_Hb = (T_a_2d - H_b_2d).norm();
-        const double extended_reach = max_horizontal_reach_a * 2.0;
-        should_check = (dist_Ta_to_Pb <= extended_reach || dist_Ta_to_Hb <= extended_reach);
-      } else {
-        const double dist_Pb_to_Ca = (P_b_2d - C_a_2d).norm();
-        const double dist_Hb_to_Ca = (H_b_2d - C_a_2d).norm();
-        const double min_horizontal_dist = std::min(dist_Pb_to_Ca, dist_Hb_to_Ca);
-        should_check = (min_horizontal_dist <= max_horizontal_reach_a + 5.0);
+      {
+        const Eigen::Vector3d C_a_2d_3(C_a_2d.x(), C_a_2d.y(), 0.0);
+        const Eigen::Vector3d P_b_2d_3(P_b_2d.x(), P_b_2d.y(), 0.0);
+        const Eigen::Vector3d H_b_2d_3(H_b_2d.x(), H_b_2d.y(), 0.0);
+        const double dist_rope_to_Ca = pointSegmentDistance(C_a_2d_3, P_b_2d_3, H_b_2d_3);
+        const double reach = is_prediction ? (max_horizontal_reach_a * 2.0) : (max_horizontal_reach_a + 5.0);
+        should_check = (dist_rope_to_Ca <= reach);
       }
 
       if (should_check) {
         if (height_check_rope) {
           const double d_armA_ropeB = segmentSegmentDistance(C_a, T_a, P_b, H_b) -
                                       (cfg_.crane_a.arm_radius + cfg_.crane_b.rope_radius);
-          d_min = std::min(d_min, d_armA_ropeB);
+          out.arm_rope = std::min(out.arm_rope, d_armA_ropeB);
+          out.min = std::min(out.min, d_armA_ropeB);
         }
         if (height_check_hook) {
           const double d_armA_hookB = pointSegmentDistance(H_b, C_a, T_a) -
                                       (cfg_.crane_a.arm_radius + cfg_.crane_b.hook_radius);
-          d_min = std::min(d_min, d_armA_hookB);
+          out.arm_hook = std::min(out.arm_hook, d_armA_hookB);
+          out.min = std::min(out.min, d_armA_hookB);
         }
       }
     }
   }
 
-  if (arm_height_b < arm_height_a) {
+  if (arm_height_b <= arm_height_a + kHeightEps) {
     const double arm_top_b = arm_height_b + cfg_.crane_b.arm_radius;
     const double rope_bottom_a = std::min(H_a.z(), P_a.z()) - cfg_.crane_a.rope_radius;
     const double hook_bottom_a = H_a.z() - cfg_.crane_a.hook_radius;
@@ -483,35 +588,33 @@ double AntiCollisionCore::computeMinDistanceAtTimeWithDecel(double t, double dec
           std::max(cfg_.crane_a.rope_radius, cfg_.crane_a.hook_radius);
 
       bool should_check = false;
-      if (is_prediction) {
-        const Eigen::Vector2d T_b_2d = T_b.head<2>();
-        const double dist_Tb_to_Pa = (T_b_2d - P_a_2d).norm();
-        const double dist_Tb_to_Ha = (T_b_2d - H_a_2d).norm();
-        const double extended_reach = max_horizontal_reach_b * 2.0;
-        should_check = (dist_Tb_to_Pa <= extended_reach || dist_Tb_to_Ha <= extended_reach);
-      } else {
-        const double dist_Pa_to_Cb = (P_a_2d - C_b_2d).norm();
-        const double dist_Ha_to_Cb = (H_a_2d - C_b_2d).norm();
-        const double min_horizontal_dist = std::min(dist_Pa_to_Cb, dist_Ha_to_Cb);
-        should_check = (min_horizontal_dist <= max_horizontal_reach_b + 5.0);
+      {
+        const Eigen::Vector3d C_b_2d_3(C_b_2d.x(), C_b_2d.y(), 0.0);
+        const Eigen::Vector3d P_a_2d_3(P_a_2d.x(), P_a_2d.y(), 0.0);
+        const Eigen::Vector3d H_a_2d_3(H_a_2d.x(), H_a_2d.y(), 0.0);
+        const double dist_rope_to_Cb = pointSegmentDistance(C_b_2d_3, P_a_2d_3, H_a_2d_3);
+        const double reach = is_prediction ? (max_horizontal_reach_b * 2.0) : (max_horizontal_reach_b + 5.0);
+        should_check = (dist_rope_to_Cb <= reach);
       }
 
       if (should_check) {
         if (height_check_rope) {
           const double d_armB_ropeA = segmentSegmentDistance(C_b, T_b, P_a, H_a) -
                                       (cfg_.crane_b.arm_radius + cfg_.crane_a.rope_radius);
-          d_min = std::min(d_min, d_armB_ropeA);
+          out.arm_rope = std::min(out.arm_rope, d_armB_ropeA);
+          out.min = std::min(out.min, d_armB_ropeA);
         }
         if (height_check_hook) {
           const double d_armB_hookA = pointSegmentDistance(H_a, C_b, T_b) -
                                       (cfg_.crane_b.arm_radius + cfg_.crane_a.hook_radius);
-          d_min = std::min(d_min, d_armB_hookA);
+          out.arm_hook = std::min(out.arm_hook, d_armB_hookA);
+          out.min = std::min(out.min, d_armB_hookA);
         }
       }
     }
   }
 
-  return d_min;
+  return out;
 }
 
 AntiCollisionCore::CraneState AntiCollisionCore::predictStateWithDecel(const CraneState& state, double t, const CraneParams& params,
@@ -519,9 +622,13 @@ AntiCollisionCore::CraneState AntiCollisionCore::predictStateWithDecel(const Cra
   CraneState pred = state;
   if (t <= 0.0) return pred;
 
-  double v_theta_final = state.theta_dot_deg_per_sec;
-  double v_r_final = state.r_dot_m_per_sec;
-  double v_z_final = state.z_dot_m_per_sec;
+  const double v_theta_input = cfg_.command_fusion_enabled ? state.theta_dot_pred_rad_per_sec : state.theta_dot_rad_per_sec;
+  const double v_r_input = cfg_.command_fusion_enabled ? state.r_dot_pred_m_per_sec : state.r_dot_m_per_sec;
+  const double v_z_input = cfg_.command_fusion_enabled ? state.z_dot_pred_m_per_sec : state.z_dot_m_per_sec;
+
+  double v_theta_final = v_theta_input;
+  double v_r_final = v_r_input;
+  double v_z_final = v_z_input;
 
   if (decel_theta > 0.0) {
     const double t_stop_theta = std::abs(v_theta_final) / decel_theta;
@@ -563,9 +670,9 @@ AntiCollisionCore::CraneState AntiCollisionCore::predictStateWithDecel(const Cra
     return v0 * t_stop - 0.5 * (v0 > 0 ? decel : -decel) * t_stop * t_stop;
   };
 
-  pred.theta_deg += computeDistanceWithDecel(state.theta_dot_deg_per_sec, t, decel_theta);
-  pred.r = clampDouble(state.r + computeDistanceWithDecel(state.r_dot_m_per_sec, t, decel_r), 0.0, params.arm_length);
-  pred.z = std::max(0.0, state.z + computeDistanceWithDecel(state.z_dot_m_per_sec, t, decel_z));
+  pred.theta_rad += computeDistanceWithDecel(v_theta_input, t, decel_theta);
+  pred.r = clampDouble(state.r + computeDistanceWithDecel(v_r_input, t, decel_r), 0.0, params.arm_length);
+  pred.z = std::max(0.0, state.z + computeDistanceWithDecel(v_z_input, t, decel_z));
   return pred;
 }
 

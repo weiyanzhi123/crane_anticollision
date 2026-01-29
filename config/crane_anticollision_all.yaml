@@ -12,7 +12,8 @@ crane_teleop_evdev:
 
   output_topic_a: /crane_teleop/crane_a_states
   output_topic_b: /crane_teleop/crane_b_states
-  output_topic_c: /crane_teleop/crane_c_states
+  gear_limit_topic_a: /planner/gear_limit_a
+  gear_limit_topic_b: /planner/gear_limit_b
 
   hz: 50.0
 
@@ -20,6 +21,11 @@ crane_teleop_evdev:
   vel_theta_deg_per_sec: 5.0
   vel_r_m_per_sec: 0.5
   vel_z_m_per_sec: 0.3
+
+  # Gear speeds
+  slew_gears_deg_per_sec: [0.7, 1.77, 2.66, 3.5]
+  trolley_gears_m_per_sec: [0.263, 0.616, 1.036]
+  hoist_gears_m_per_sec: [0.0735, 0.182, 0.362, 0.460, 0.604]
 
   # Acceleration (deg/s^2, m/s^2, m/s^2)
   accel_theta_deg_per_sec2: 10.0
@@ -40,18 +46,15 @@ crane_teleop_evdev:
   init_b_r: 22.0
   init_b_z: 6.0
 
-  init_c_theta_deg: 120.0
-  init_c_r: 18.0
-  init_c_z: 20.0
-
-  # Control (optional)
-  enable_crane_c_control: true
-
 multi_crane_anticollision:
   # Topics
   crane_a_state_topic: /crane_teleop/crane_a_states
   crane_b_state_topic: /crane_teleop/crane_b_states
-  crane_c_state_topic: /crane_teleop/crane_c_states
+
+  # Gear limits (per-axis max gear)
+  gear_count_theta: 4
+  gear_count_r: 3
+  gear_count_z: 5
 
   # Crane A geometry
   crane_a:
@@ -59,7 +62,7 @@ multi_crane_anticollision:
     base_y: 0.0
     base_z: 0.0
     mast_height: 55.0
-    theta_offset_deg: 0.0
+    theta_offset_rad: 0.0
     arm_length: 36.6667
     arm_width: 1.0
     arm_thickness: 0.5
@@ -72,26 +75,13 @@ multi_crane_anticollision:
     base_y: 35.3553
     base_z: 0.0
     mast_height: 35.0
-    theta_offset_deg: 0.0
+    theta_offset_rad: 0.0
     arm_length: 33.3333
     arm_width: 1.0
     arm_thickness: 0.5
     rope_radius: 0.05
     hook_radius: 0.60
 
-  # Crane C geometry
-  crane_c:
-    # Same arm height as crane_a, and center distance < sum of effective arm lengths
-    base_x: 50.0
-    base_y: 0.0
-    base_z: 0.0
-    mast_height: 55.0
-    theta_offset_deg: 0.0
-    arm_length: 36.6667
-    arm_width: 1.0
-    arm_thickness: 0.5
-    rope_radius: 0.05
-    hook_radius: 0.60
 
   # Thresholds
   D_safe: 10.0
@@ -114,17 +104,32 @@ multi_crane_anticollision:
   t_margin: 0.2
 
   # Velocity clamp (used for velocity estimation)
-  max_theta_dot_deg_per_sec: 10.0
+  max_theta_dot_rad_per_sec: 0.17453292519943295
   max_r_dot_m_per_sec: 1.0
   max_z_dot_m_per_sec: 0.5
+
+  # Movement speed weights (slew/trolley/hoist)
+  speed_weight_slew: 1.0
+  speed_weight_trolley: 0.6
+  speed_weight_hoist: 0.3
+
+  # Command-fusion (encoder trend) for prediction
+  command_fusion_enabled: true
+  command_fusion_alpha: 0.6
+  command_fusion_lead_time: 0.2
+
+  # Latency compensation & braking-distance guard
+  latency_compensation_enabled: true
+  latency_compensation_time: 0.15
+  braking_distance_guard_enabled: true
+  braking_distance_margin: 0.5
 
   # Priority (strategy 3)
   crane_a_priority: 1.0
   crane_b_priority: 0.5
-  crane_c_priority: 0.4
 
   # Prediction deceleration (used by core prediction)
-  prediction_decel_theta_deg_per_sec2: 15.0
+  prediction_decel_theta_rad_per_sec2: 0.2617993877991494
   prediction_decel_r_m_per_sec2: 1.5
   prediction_decel_z_m_per_sec2: 0.9
 
@@ -134,24 +139,22 @@ multi_crane_viz:
   world_frame: world
   marker_topic: /crane_anticollision/markers
   viz_hz: 20.0
+  enable_crane_c: false
+  slew_gears_deg_per_sec: [0.7, 1.77, 2.66, 3.5]
+  trolley_gears_m_per_sec: [0.263, 0.616, 1.036]
+  hoist_gears_m_per_sec: [0.0735, 0.182, 0.362, 0.460, 0.604]
 
   crane_a_state_topic: /crane_teleop/crane_a_states
   crane_b_state_topic: /crane_teleop/crane_b_states
-  crane_c_state_topic: /crane_teleop/crane_c_states
   gear_limit_topic: /planner/collision_avoid_info  # backward compatible
 
   crane_a/use_state_topic: true
   crane_b/use_state_topic: true
-  crane_c/use_state_topic: true
 
   crane_a_frame_prefix: crane_a
   crane_b_frame_prefix: crane_b
-  crane_c_frame_prefix: crane_c
 
   # Static pose (used if a crane is not subscribed to state topics)
-  static_crane_c_theta_deg: 90.0
-  static_crane_c_r: 12.0
-  static_crane_c_z: 10.0
 
   # Stop flash
   stop_red_duration: 1.0
@@ -190,24 +193,6 @@ multi_crane_viz:
     hook_radius: 0.60
     theta_offset_deg: 0.0
 
-  crane_c:
-    base_x: 50.0
-    base_y: 0.0
-    base_z: 0.0
-    mast_height: 55.0
-    mast_radius: 1.2
-    arm_length: 36.6667
-    arm_width: 1.0
-    arm_thickness: 0.5
-    counter_arm_length: 8.0
-    counter_arm_width: 1.0
-    counter_arm_thickness: 0.5
-    trolley_length: 1.5
-    trolley_width: 1.0
-    trolley_height: 0.8
-    rope_radius: 0.05
-    hook_radius: 0.60
-    theta_offset_deg: 0.0
 
   crane_b:
     base_x: 35.3553

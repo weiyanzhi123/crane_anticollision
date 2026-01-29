@@ -6,6 +6,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 find_package(catkin REQUIRED COMPONENTS
   roscpp
+  message_generation
   std_msgs
   geometry_msgs
   visualization_msgs
@@ -15,10 +16,20 @@ find_package(catkin REQUIRED COMPONENTS
 
 find_package(Eigen3 REQUIRED)
 
+add_message_files(
+  FILES
+  CraneGearLimit.msg
+)
+
+generate_messages(
+  DEPENDENCIES
+  std_msgs
+)
+
 catkin_package(
   INCLUDE_DIRS include
   LIBRARIES crane_anticollision_core
-  CATKIN_DEPENDS roscpp std_msgs geometry_msgs visualization_msgs tf2_ros crane_msg
+  CATKIN_DEPENDS roscpp message_runtime std_msgs geometry_msgs visualization_msgs tf2_ros crane_msg
   DEPENDS EIGEN3
 )
 
@@ -34,12 +45,12 @@ target_link_libraries(crane_anticollision_core Eigen3::Eigen)
 
 add_executable(multi_crane_anticollision_node src/multi_crane_anticollision_node.cpp)
 target_link_libraries(multi_crane_anticollision_node crane_anticollision_core ${catkin_LIBRARIES})
-add_dependencies(multi_crane_anticollision_node crane_msg_generate_messages_cpp)
+add_dependencies(multi_crane_anticollision_node crane_msg_generate_messages_cpp ${PROJECT_NAME}_generate_messages_cpp)
 
 add_executable(multi_crane_anticollision_viz_node src/multi_crane_anticollision_viz_node.cpp)
 target_link_libraries(multi_crane_anticollision_viz_node ${catkin_LIBRARIES} Eigen3::Eigen)
-add_dependencies(multi_crane_anticollision_viz_node crane_msg_generate_messages_cpp)
+add_dependencies(multi_crane_anticollision_viz_node crane_msg_generate_messages_cpp ${PROJECT_NAME}_generate_messages_cpp)
 
 add_executable(crane_teleop_evdev_node src/crane_teleop_evdev_node.cpp)
 target_link_libraries(crane_teleop_evdev_node ${catkin_LIBRARIES})
-add_dependencies(crane_teleop_evdev_node crane_msg_generate_messages_cpp)
+add_dependencies(crane_teleop_evdev_node crane_msg_generate_messages_cpp ${PROJECT_NAME}_generate_messages_cpp)

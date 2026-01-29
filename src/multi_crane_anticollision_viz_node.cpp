@@ -3,8 +3,11 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <iomanip>
 #include <limits>
+#include <sstream>
 #include <string>
+#include <vector>
 
 #include <Eigen/Dense>
 
@@ -14,6 +17,8 @@
 
 #include "crane_msg/JointPoseMsg.h"
 #include "crane_msg/LoadCollisionAvoidCtrlLimit.h"
+#include "crane_anticollision/CraneGearLimit.h"
+#include <XmlRpcValue.h>
 
 namespace {
 
@@ -111,6 +116,9 @@ struct CraneState {
   double theta_vel_deg_per_sec{0.0};
   double r_vel_m_per_sec{0.0};
   double z_vel_m_per_sec{0.0};
+  int gear_theta{0};
+  int gear_r{0};
+  int gear_z{0};
 };
 
 struct DistResult {
@@ -138,6 +146,7 @@ public:
     // Static viz mode (no state topics required)
     // use_state_topics_ is kept as a global default, but A/B can override independently.
     pnh_.param<bool>("use_state_topics", use_state_topics_, true);
+    pnh_.param<bool>("enable_crane_c", enable_crane_c_, false);
     pnh_.param<bool>("use_gear_limit_topic", use_gear_limit_topic_, true);
     pnh_.param<double>("static_crane_a_theta_deg", static_a_theta_deg_, 0.0);
     pnh_.param<double>("static_crane_a_r", static_a_r_, 10.0);
@@ -153,6 +162,9 @@ public:
     pnh_.param<bool>("crane_a/use_state_topic", use_state_topic_a_, use_state_topics_);
     pnh_.param<bool>("crane_b/use_state_topic", use_state_topic_b_, use_state_topics_);
     pnh_.param<bool>("crane_c/use_state_topic", use_state_topic_c_, use_state_topics_);
+    if (!enable_crane_c_) {
+      use_state_topic_c_ = false;
+    }
 
     // Frames
     pnh_.param<std::string>("world_frame", world_frame_, std::string("world"));
@@ -166,7 +178,16 @@ public:
     // Params for drawing
     loadCraneParams("crane_a", crane_a_params_);
     loadCraneParams("crane_b", crane_b_params_);
-    loadCraneParams("crane_c", crane_c_params_);
+    if (enable_crane_c_) {
+      loadCraneParams("crane_c", crane_c_params_);
+    }
+
+    std::vector<double> slew_gears_default{0.7, 1.77, 2.66, 3.5};
+    std::vector<double> trolley_gears_default{0.263, 0.616, 1.036};
+    std::vector<double> hoist_gears_default{0.0735, 0.182, 0.362, 0.460, 0.604};
+    loadGearList("slew_gears_deg_per_sec", slew_gears_deg_per_sec_, slew_gears_default);
+    loadGearList("trolley_gears_m_per_sec", trolley_gears_m_per_sec_, trolley_gears_default);
+    loadGearList("hoist_gears_m_per_sec", hoist_gears_m_per_sec_, hoist_gears_default);
 
     // Always seed with static pose so visualization appears immediately.
     a_.valid = true;
@@ -179,10 +200,12 @@ public:
     b_.r = static_b_r_;
     b_.z = static_b_z_;
 
-    c_.valid = true;
-    c_.theta_deg = static_c_theta_deg_;
-    c_.r = static_c_r_;
-    c_.z = static_c_z_;
+    c_.valid = enable_crane_c_;
+    if (enable_crane_c_) {
+      c_.theta_deg = static_c_theta_deg_;
+      c_.r = static_c_r_;
+      c_.z = static_c_z_;
+    }
 
     // Subscribe per crane if enabled.
     if (use_state_topic_a_) {
@@ -199,7 +222,11 @@ public:
       // 订阅两路限制信息（A和B分别）
       sub_limit_a_ = nh_.subscribe("/planner/collision_avoid_info_a", 10, &MultiCraneAntiCollisionVizNode::onLimitA, this);
       sub_limit_b_ = nh_.subscribe("/planner/collision_avoid_info_b", 10, &MultiCraneAntiCollisionVizNode::onLimitB, this);
-      sub_limit_c_ = nh_.subscribe("/planner/collision_avoid_info_c", 10, &MultiCraneAntiCollisionVizNode::onLimitC, this);
+      sub_gear_limit_a_ = nh_.subscribe("/planner/gear_limit_a", 10, &MultiCraneAntiCollisionVizNode::onGearLimitA, this);
+      sub_gear_limit_b_ = nh_.subscribe("/planner/gear_limit_b", 10, &MultiCraneAntiCollisionVizNode::onGearLimitB, this);
+      if (enable_crane_c_) {
+        sub_limit_c_ = nh_.subscribe("/planner/collision_avoid_info_c", 10, &MultiCraneAntiCollisionVizNode::onLimitC, this);
+      }
       // 也保留旧的单一topic订阅（向后兼容）
       sub_limit_ = nh_.subscribe(gear_limit_topic_, 10, &MultiCraneAntiCollisionVizNode::onLimit, this);
     } else {
@@ -256,6 +283,18 @@ private:
     pnh_.param<double>(ns + "/hook_radius", p.hook_radius, p.hook_radius);
   }
 
+  void loadGearList(const std::string& name, std::vector<double>& out, const std::vector<double>& defaults) {
+    XmlRpc::XmlRpcValue value;
+    if (pnh_.getParam(name, value) && value.getType() == XmlRpc::XmlRpcValue::TypeArray) {
+      out.clear();
+      for (int i = 0; i < value.size(); ++i) {
+        out.push_back(static_cast<double>(value[i]));
+      }
+    } else {
+      out = defaults;
+    }
+  }
+
   void onCraneA(const crane_msg::JointPoseMsg::ConstPtr& msg) {
     a_.valid = !msg->SensorMsgError;
     a_.theta_deg = msg->PolarAngle + crane_a_params_.theta_offset_deg;
@@ -264,6 +303,15 @@ private:
     a_.theta_vel_deg_per_sec = msg->PolarAngleVel;
     a_.r_vel_m_per_sec = msg->PolarRadiusVel;
     a_.z_vel_m_per_sec = msg->PolarHeightVel;
+    a_.gear_theta = msg->PLCMode % 10;
+    a_.gear_r = (msg->PLCMode / 10) % 10;
+    a_.gear_z = (msg->PLCMode / 100) % 10;
+    const int max_theta = static_cast<int>(slew_gears_deg_per_sec_.size());
+    const int max_r = static_cast<int>(trolley_gears_m_per_sec_.size());
+    const int max_z = static_cast<int>(hoist_gears_m_per_sec_.size());
+    a_.gear_theta = std::max(0, std::min(a_.gear_theta, max_theta));
+    a_.gear_r = std::max(0, std::min(a_.gear_r, max_r));
+    a_.gear_z = std::max(0, std::min(a_.gear_z, max_z));
   }
 
   void onCraneB(const crane_msg::JointPoseMsg::ConstPtr& msg) {
@@ -274,6 +322,15 @@ private:
     b_.theta_vel_deg_per_sec = msg->PolarAngleVel;
     b_.r_vel_m_per_sec = msg->PolarRadiusVel;
     b_.z_vel_m_per_sec = msg->PolarHeightVel;
+    b_.gear_theta = msg->PLCMode % 10;
+    b_.gear_r = (msg->PLCMode / 10) % 10;
+    b_.gear_z = (msg->PLCMode / 100) % 10;
+    const int max_theta = static_cast<int>(slew_gears_deg_per_sec_.size());
+    const int max_r = static_cast<int>(trolley_gears_m_per_sec_.size());
+    const int max_z = static_cast<int>(hoist_gears_m_per_sec_.size());
+    b_.gear_theta = std::max(0, std::min(b_.gear_theta, max_theta));
+    b_.gear_r = std::max(0, std::min(b_.gear_r, max_r));
+    b_.gear_z = std::max(0, std::min(b_.gear_z, max_z));
   }
 
   void onCraneC(const crane_msg::JointPoseMsg::ConstPtr& msg) {
@@ -328,6 +385,18 @@ private:
       stop_b_ = false;
       stop_time_b_ = ros::Time();  // 重置为无效时间
     }
+  }
+
+  void onGearLimitA(const crane_anticollision::CraneGearLimit::ConstPtr& msg) {
+    gear_limit_theta_a_ = msg->gear_theta_limit;
+    gear_limit_r_a_ = msg->gear_r_limit;
+    gear_limit_z_a_ = msg->gear_z_limit;
+  }
+
+  void onGearLimitB(const crane_anticollision::CraneGearLimit::ConstPtr& msg) {
+    gear_limit_theta_b_ = msg->gear_theta_limit;
+    gear_limit_r_b_ = msg->gear_r_limit;
+    gear_limit_z_b_ = msg->gear_z_limit;
   }
 
   void onLimitC(const crane_msg::LoadCollisionAvoidCtrlLimit::ConstPtr& msg) {
@@ -555,7 +624,7 @@ private:
   }
 
   void onTimer(const ros::TimerEvent&) {
-    if (!a_.valid || !b_.valid || !c_.valid) {
+    if (!a_.valid || !b_.valid || (enable_crane_c_ && !c_.valid)) {
       // In static mode we should always be valid; in dynamic mode, wait for messages.
       return;
     }
@@ -593,16 +662,18 @@ private:
     // TF: base + slew center + trolley + hook
     publishTF(crane_a_prefix_ + "/base", base_a);
     publishTF(crane_b_prefix_ + "/base", base_b);
-    publishTF(crane_c_prefix_ + "/base", base_c);
     publishTF(crane_a_prefix_ + "/slew_center", ca);
     publishTF(crane_b_prefix_ + "/slew_center", cb);
-    publishTF(crane_c_prefix_ + "/slew_center", cc);
     publishTF(crane_a_prefix_ + "/trolley", trolley_a);
     publishTF(crane_b_prefix_ + "/trolley", trolley_b);
-    publishTF(crane_c_prefix_ + "/trolley", trolley_c);
     publishTF(crane_a_prefix_ + "/hook", ha);
     publishTF(crane_b_prefix_ + "/hook", hb);
-    publishTF(crane_c_prefix_ + "/hook", hc);
+    if (enable_crane_c_) {
+      publishTF(crane_c_prefix_ + "/base", base_c);
+      publishTF(crane_c_prefix_ + "/slew_center", cc);
+      publishTF(crane_c_prefix_ + "/trolley", trolley_c);
+      publishTF(crane_c_prefix_ + "/hook", hc);
+    }
 
     // Color by risk state (from gear limit topic)
     float cr = 0.2f, cg = 0.9f, cbg = 0.2f;  // SAFE green
@@ -647,15 +718,17 @@ private:
     }
 
     // C塔闪烁逻辑
-    if (risk_level_c_ >= 1.0) {  // 有风险（低风险或高风险）
-      if (risk_level_c_ >= 2.0) {
-        double period = 1.0 / high_risk_flash_freq_;
-        double phase = std::fmod(now.toSec(), period);
-        show_red_c = (phase < period * 0.5);
-      } else {
-        double period = 1.0 / low_risk_flash_freq_;
-        double phase = std::fmod(now.toSec(), period);
-        show_red_c = (phase < period * 0.5);
+    if (enable_crane_c_) {
+      if (risk_level_c_ >= 1.0) {  // 有风险（低风险或高风险）
+        if (risk_level_c_ >= 2.0) {
+          double period = 1.0 / high_risk_flash_freq_;
+          double phase = std::fmod(now.toSec(), period);
+          show_red_c = (phase < period * 0.5);
+        } else {
+          double period = 1.0 / low_risk_flash_freq_;
+          double phase = std::fmod(now.toSec(), period);
+          show_red_c = (phase < period * 0.5);
+        }
       }
     }
     
@@ -702,22 +775,42 @@ private:
       }
 
       // C的颜色
-      if (risk_level_c_ >= 2.0) {
-        if (show_red_c) {
-          cr_c = 1.0f; cg_c = 0.0f; cbg_c = 0.0f;
-        } else {
-          cr_c = 0.95f; cg_c = 0.1f; cbg_c = 0.1f;
-        }
-      } else if (risk_level_c_ >= 1.0) {
-        if (show_red_c) {
-          cr_c = 1.0f; cg_c = 0.0f; cbg_c = 0.0f;
-        } else {
-          cr_c = 0.95f; cg_c = 0.85f; cbg_c = 0.1f;
+      if (enable_crane_c_) {
+        if (risk_level_c_ >= 2.0) {
+          if (show_red_c) {
+            cr_c = 1.0f; cg_c = 0.0f; cbg_c = 0.0f;
+          } else {
+            cr_c = 0.95f; cg_c = 0.1f; cbg_c = 0.1f;
+          }
+        } else if (risk_level_c_ >= 1.0) {
+          if (show_red_c) {
+            cr_c = 1.0f; cg_c = 0.0f; cbg_c = 0.0f;
+          } else {
+            cr_c = 0.95f; cg_c = 0.85f; cbg_c = 0.1f;
+          }
         }
       }
     }
 
     visualization_msgs::MarkerArray arr;
+
+    auto formatGearText = [](const std::string& label, int gear, int limit, const std::vector<double>& gears,
+                             double cur, const std::string& unit) {
+      int max_gear = static_cast<int>(gears.size());
+      if (max_gear < 0) max_gear = 0;
+      int gear_idx = std::max(0, std::min(gear, max_gear));
+      int limit_idx = std::max(0, std::min(limit, max_gear));
+      double set_v = 0.0;
+      if (gear_idx >= 1 && gear_idx <= max_gear) {
+        set_v = gears[gear_idx - 1];
+      }
+      std::ostringstream oss;
+      oss << label << " G" << gear_idx << "/" << max_gear
+          << " lim=" << limit_idx
+          << " set=" << std::fixed << std::setprecision(3) << set_v << unit
+          << " cur=" << std::fixed << std::setprecision(3) << std::abs(cur) << unit;
+      return oss.str();
+    };
 
     // Crane A: mast + arm + trolley + rope + hook
     {
@@ -779,6 +872,22 @@ private:
           arr.markers.push_back(makeDeleteMarker(9, "crane_a/arrow_hook", visualization_msgs::Marker::ARROW));
         }
       }
+
+      const Eigen::Vector3d gear_theta_pos = ca + 0.9 * crane_a_params_.arm_length * dir_a + Eigen::Vector3d(0.0, 0.0, 2.0);
+      const Eigen::Vector3d gear_r_pos = trolley_a + Eigen::Vector3d(0.0, 0.0, 2.0);
+      const Eigen::Vector3d gear_z_pos = ha + Eigen::Vector3d(0.0, 0.0, 2.0);
+      const std::string gear_theta_text = formatGearText("theta", a_.gear_theta, gear_limit_theta_a_, slew_gears_deg_per_sec_,
+                                                         a_.theta_vel_deg_per_sec, "deg/s");
+      const std::string gear_r_text = formatGearText("r", a_.gear_r, gear_limit_r_a_, trolley_gears_m_per_sec_,
+                                                     a_.r_vel_m_per_sec, "m/s");
+      const std::string gear_z_text = formatGearText("z", a_.gear_z, gear_limit_z_a_, hoist_gears_m_per_sec_,
+                                                     a_.z_vel_m_per_sec, "m/s");
+      arr.markers.push_back(makeTextMarker(101, "crane_a/gear_theta", gear_theta_pos, gear_theta_text,
+                                           1.0, 0.95f, 0.95f, 0.95f, 0.95f));
+      arr.markers.push_back(makeTextMarker(102, "crane_a/gear_r", gear_r_pos, gear_r_text,
+                                           1.0, 0.95f, 0.95f, 0.95f, 0.95f));
+      arr.markers.push_back(makeTextMarker(103, "crane_a/gear_z", gear_z_pos, gear_z_text,
+                                           1.0, 0.95f, 0.95f, 0.95f, 0.95f));
     }
 
     // Crane B: mast + arm + trolley + rope + hook
@@ -841,10 +950,26 @@ private:
           arr.markers.push_back(makeDeleteMarker(19, "crane_b/arrow_hook", visualization_msgs::Marker::ARROW));
         }
       }
+
+      const Eigen::Vector3d gear_theta_pos = cb + 0.9 * crane_b_params_.arm_length * dir_b + Eigen::Vector3d(0.0, 0.0, 2.0);
+      const Eigen::Vector3d gear_r_pos = trolley_b + Eigen::Vector3d(0.0, 0.0, 2.0);
+      const Eigen::Vector3d gear_z_pos = hb + Eigen::Vector3d(0.0, 0.0, 2.0);
+      const std::string gear_theta_text = formatGearText("theta", b_.gear_theta, gear_limit_theta_b_, slew_gears_deg_per_sec_,
+                                                         b_.theta_vel_deg_per_sec, "deg/s");
+      const std::string gear_r_text = formatGearText("r", b_.gear_r, gear_limit_r_b_, trolley_gears_m_per_sec_,
+                                                     b_.r_vel_m_per_sec, "m/s");
+      const std::string gear_z_text = formatGearText("z", b_.gear_z, gear_limit_z_b_, hoist_gears_m_per_sec_,
+                                                     b_.z_vel_m_per_sec, "m/s");
+      arr.markers.push_back(makeTextMarker(111, "crane_b/gear_theta", gear_theta_pos, gear_theta_text,
+                                           1.0, 0.95f, 0.95f, 0.95f, 0.95f));
+      arr.markers.push_back(makeTextMarker(112, "crane_b/gear_r", gear_r_pos, gear_r_text,
+                                           1.0, 0.95f, 0.95f, 0.95f, 0.95f));
+      arr.markers.push_back(makeTextMarker(113, "crane_b/gear_z", gear_z_pos, gear_z_text,
+                                           1.0, 0.95f, 0.95f, 0.95f, 0.95f));
     }
 
-    // Crane C: mast + arm + trolley + rope + hook
-    {
+    if (enable_crane_c_) {
+      // Crane C: mast + arm + trolley + rope + hook
       const Eigen::Vector3d mast_center = base_c + Eigen::Vector3d(0.0, 0.0, 0.5 * crane_c_params_.mast_height);
       arr.markers.push_back(makeCylinderMarker(21, "crane_c/mast", mast_center,
                                                crane_c_params_.mast_radius, crane_c_params_.mast_height,
@@ -907,19 +1032,22 @@ private:
 
     // Distance summary (computed here for visualization)
     const DistResult d_ab = computeDistance(ca, ta, cb, tb, trolley_a, ha, trolley_b, hb);
-    const DistResult d_ac = computeDistance(ca, ta, cc, tc, trolley_a, ha, trolley_c, hc);
-    const DistResult d_bc = computeDistance(cb, tb, cc, tc, trolley_b, hb, trolley_c, hc);
     DistResult d_min = d_ab;
     std::string pair_label = "A-B:" + d_ab.pair;
-    if (d_ac.d_min < d_min.d_min) {
-      d_min = d_ac;
-      pair_label = "A-C:" + d_ac.pair;
+    Eigen::Vector3d text_pos = (ca + cb) * 0.5 + Eigen::Vector3d(0.0, 0.0, 3.0);
+    if (enable_crane_c_) {
+      const DistResult d_ac = computeDistance(ca, ta, cc, tc, trolley_a, ha, trolley_c, hc);
+      const DistResult d_bc = computeDistance(cb, tb, cc, tc, trolley_b, hb, trolley_c, hc);
+      if (d_ac.d_min < d_min.d_min) {
+        d_min = d_ac;
+        pair_label = "A-C:" + d_ac.pair;
+      }
+      if (d_bc.d_min < d_min.d_min) {
+        d_min = d_bc;
+        pair_label = "B-C:" + d_bc.pair;
+      }
+      text_pos = (ca + cb + cc) / 3.0 + Eigen::Vector3d(0.0, 0.0, 3.0);
     }
-    if (d_bc.d_min < d_min.d_min) {
-      d_min = d_bc;
-      pair_label = "B-C:" + d_bc.pair;
-    }
-    const Eigen::Vector3d text_pos = (ca + cb + cc) / 3.0 + Eigen::Vector3d(0.0, 0.0, 3.0);
     const std::string text = "level=" + level + "  d_min=" + std::to_string(d_min.d_min) + "  pair=" + pair_label;
     arr.markers.push_back(makeTextMarker(100, "summary", text_pos, text, 0.8, 1.0f, 1.0f, 1.0f, 0.95f));
 
@@ -936,6 +1064,8 @@ private:
   ros::Subscriber sub_limit_;
   ros::Subscriber sub_limit_a_;
   ros::Subscriber sub_limit_b_;
+  ros::Subscriber sub_gear_limit_a_;
+  ros::Subscriber sub_gear_limit_b_;
   ros::Subscriber sub_limit_c_;
   ros::Publisher pub_markers_;
   ros::Timer timer_;
@@ -976,6 +1106,13 @@ private:
   double risk_level_a_{0.0};  // A塔风险等级
   double risk_level_b_{0.0};  // B塔风险等级
   double risk_level_c_{0.0};  // C塔风险等级
+
+  int gear_limit_theta_a_{0};
+  int gear_limit_r_a_{0};
+  int gear_limit_z_a_{0};
+  int gear_limit_theta_b_{0};
+  int gear_limit_r_b_{0};
+  int gear_limit_z_b_{0};
   
   // 闪烁频率参数
   double low_risk_flash_freq_{1.0};   // 低风险闪烁频率（Hz）
@@ -994,6 +1131,7 @@ private:
   double arrow_head_length_m_{0.7};
 
   bool use_state_topics_{true};
+  bool enable_crane_c_{false};
   bool use_state_topic_a_{true};
   bool use_state_topic_b_{true};
   bool use_state_topic_c_{true};
@@ -1007,6 +1145,10 @@ private:
   double static_c_theta_deg_{90.0};
   double static_c_r_{12.0};
   double static_c_z_{10.0};
+
+  std::vector<double> slew_gears_deg_per_sec_;
+  std::vector<double> trolley_gears_m_per_sec_;
+  std::vector<double> hoist_gears_m_per_sec_;
 };
 
 int main(int argc, char** argv) {
